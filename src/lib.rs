@@ -6,9 +6,10 @@ use num_traits::FromPrimitive;
 use nusb::MaybeFuture;
 use rusb::*;
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, Result};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -227,7 +228,7 @@ impl UsbIpServer {
                 }
             };
 
-            let handle = Arc::new(Mutex::new(open_device));
+            let handle = Arc::new(open_device);
             let usb_bcd = {
                 let v = desc.usb_version();
                 ((v.major() as u16) << 8) | ((v.minor() as u16) << 4) | v.sub_minor() as u16
@@ -236,7 +237,7 @@ impl UsbIpServer {
                 // GET_DESCRIPTOR(BOS): bmRequestType 0x80 (IN, standard, device),
                 // bRequest 6, wValue = BOS descriptor type << 8.
                 let mut buf = vec![0u8; 256];
-                match handle.lock().unwrap().read_control(
+                match handle.read_control(
                     0x80,
                     0x06,
                     (DescriptorType::BOS as u16) << 8,
@@ -254,27 +255,15 @@ impl UsbIpServer {
                 Vec::new()
             };
             let mut interfaces = vec![];
-            handle
-                .lock()
-                .unwrap()
-                .set_auto_detach_kernel_driver(true)
-                .ok();
+            handle.set_auto_detach_kernel_driver(true).ok();
             for intf in cfg.interfaces() {
                 // ignore alternate settings
                 let intf_desc = intf.descriptors().next().unwrap();
-                handle
-                    .lock()
-                    .unwrap()
-                    .set_auto_detach_kernel_driver(true)
-                    .ok();
+                handle.set_auto_detach_kernel_driver(true).ok();
                 // usbfs requires the interface to be claimed before submitting
                 // transfers; libusb's auto-detach makes this also detach a bound
                 // kernel driver.
-                handle
-                    .lock()
-                    .unwrap()
-                    .claim_interface(intf_desc.interface_number())
-                    .ok();
+                handle.claim_interface(intf_desc.interface_number()).ok();
                 let mut endpoints = vec![];
                 let mut endpoint_extra = vec![];
 
@@ -356,7 +345,7 @@ impl UsbIpServer {
             // crashed enumeration - and with it every other device - instead of just
             // leaving that one string unset.
             if let Some(index) = desc.manufacturer_string_index() {
-                match handle.lock().unwrap().read_string_descriptor_ascii(index) {
+                match handle.read_string_descriptor_ascii(index) {
                     Ok(s) => device.string_manufacturer = device.new_string(&s),
                     Err(err) => warn!(
                         "[{:04x}:{:04x} {}] failed to read manufacturer string descriptor (index={index}): {err}",
@@ -365,7 +354,7 @@ impl UsbIpServer {
                 }
             }
             if let Some(index) = desc.product_string_index() {
-                match handle.lock().unwrap().read_string_descriptor_ascii(index) {
+                match handle.read_string_descriptor_ascii(index) {
                     Ok(s) => device.string_product = device.new_string(&s),
                     Err(err) => warn!(
                         "[{:04x}:{:04x} {}] failed to read product string descriptor (index={index}): {err}",
@@ -374,7 +363,7 @@ impl UsbIpServer {
                 }
             }
             if let Some(index) = desc.serial_number_string_index() {
-                match handle.lock().unwrap().read_string_descriptor_ascii(index) {
+                match handle.read_string_descriptor_ascii(index) {
                     Ok(s) => device.string_serial = device.new_string(&s),
                     Err(err) => warn!(
                         "[{:04x}:{:04x} {}] failed to read serial number string descriptor (index={index}): {err}",
@@ -458,14 +447,167 @@ impl UsbIpServer {
     }
 }
 
+/// `ECONNRESET` on Linux, the status of a RET_UNLINK whose URB was cancelled.
+const ECONNRESET: i32 = 104;
+
+/// A URB queued for the lane of its endpoint.
+struct Urb {
+    /// Header of the RET_SUBMIT that answers this URB.
+    header: usbip_protocol::UsbIpHeaderBasic,
+    real_ep: u8,
+    transfer_buffer_length: u32,
+    setup: [u8; 8],
+    data: Vec<u8>,
+}
+
+/// What a connection shares with the lanes it spawns.
+#[derive(Clone)]
+struct LaneContext {
+    device: Arc<UsbDevice>,
+    responses: tokio::sync::mpsc::UnboundedSender<UsbIpResponse>,
+    /// Seqnums of URBs that are submitted and neither answered nor unlinked.
+    pending: Arc<Mutex<HashSet<u32>>>,
+    /// Set once the client is gone; IN transfers stop waiting for data.
+    closed: Arc<AtomicBool>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl LaneContext {
+    fn is_pending(&self, seqnum: u32) -> bool {
+        !self.closed.load(Ordering::Relaxed) && self.pending.lock().unwrap().contains(&seqnum)
+    }
+
+    /// Run the URBs of one endpoint in submission order on a thread of its own.
+    ///
+    /// Each endpoint gets a lane so that an IN transfer waiting for data holds up
+    /// only its own endpoint. The thread ends once the returned sender is dropped.
+    fn spawn_lane(&self) -> std::sync::mpsc::Sender<Urb> {
+        let (tx, rx) = std::sync::mpsc::channel::<Urb>();
+        let ctx = self.clone();
+        std::thread::spawn(move || {
+            for urb in rx {
+                let res = ctx.run(&urb);
+                // an unlinked URB is no longer pending and gets no RET_SUBMIT
+                if ctx.pending.lock().unwrap().remove(&urb.header.seqnum) {
+                    let _ = ctx.responses.send(res);
+                }
+            }
+        });
+        tx
+    }
+
+    fn run(&self, urb: &Urb) -> UsbIpResponse {
+        let header = &urb.header;
+        let Some((ep, intf)) = self.device.find_ep(urb.real_ep) else {
+            warn!("Endpoint {:02x?} not found", urb.real_ep);
+            return UsbIpResponse::usbip_ret_submit_fail(header);
+        };
+        let out = header.direction == 0;
+        trace!("->Endpoint {ep:02x?}");
+        trace!("->Setup {:02x?}", urb.setup);
+        trace!("->Request {:02x?}", urb.data);
+        // Host passthrough transfers bypass the interface lock; see
+        // [host::endpoint_transfer]. Control transfers keep the handler path.
+        let direct = intf
+            .filter(|_| ep.attributes != EndpointAttributes::Control as u8)
+            .and_then(|intf| {
+                let mut handler = intf.handler.lock().unwrap();
+                handler
+                    .as_any()
+                    .downcast_ref::<RusbUsbHostInterfaceHandler>()
+                    .map(RusbUsbHostInterfaceHandler::handle)
+            });
+        loop {
+            let resp = match &direct {
+                Some(handle) => {
+                    host::endpoint_transfer(handle, ep, urb.transfer_buffer_length, &urb.data)
+                }
+                None => self.runtime.block_on(self.device.handle_urb(
+                    ep,
+                    intf,
+                    urb.transfer_buffer_length,
+                    SetupPacket::parse(&urb.setup),
+                    &urb.data,
+                )),
+            };
+            match resp {
+                // An IN transfer without data stays pending, as on a real host
+                // controller, until data arrives or the client unlinks it.
+                Err(err) if err.kind() == ErrorKind::TimedOut && !out => {
+                    if self.is_pending(header.seqnum) {
+                        continue;
+                    }
+                    return UsbIpResponse::usbip_ret_submit_fail(header);
+                }
+                Ok(resp) => {
+                    if out {
+                        trace!("<-Wrote {}", urb.data.len());
+                    } else {
+                        trace!("<-Resp {resp:02x?}");
+                    }
+                    let actual_length = if out {
+                        debug_assert!(
+                            resp.is_empty(),
+                            "OUT transfer should return empty response buffer"
+                        );
+                        urb.data.len() as u32
+                    } else {
+                        resp.len() as u32
+                    };
+                    return UsbIpResponse::usbip_ret_submit_success(
+                        header,
+                        0,
+                        0,
+                        actual_length,
+                        resp,
+                        vec![],
+                    );
+                }
+                Err(err) => {
+                    warn!("Error handling URB: {err}");
+                    return UsbIpResponse::usbip_ret_submit_fail(header);
+                }
+            }
+        }
+    }
+}
+
+/// Serve one USB/IP client on `socket`.
+///
+/// Commands are read in order. URBs run concurrently, one lane per endpoint,
+/// and their RET_SUBMITs go out in the order the URBs complete.
 pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
-    mut socket: &mut T,
+    socket: &mut T,
     server: Arc<UsbIpServer>,
 ) -> Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(socket);
+    let (responses, mut outbox) = tokio::sync::mpsc::unbounded_channel::<UsbIpResponse>();
+    let commands = read_commands(&mut reader, server, responses);
+    let replies = async move {
+        // ends once the command loop and every lane have dropped their sender
+        while let Some(res) = outbox.recv().await {
+            res.write_to_socket(&mut writer).await?;
+        }
+        Ok(())
+    };
+    let (read, write) = tokio::join!(commands, replies);
+    read.and(write)
+}
+
+async fn read_commands<T: AsyncReadExt + Unpin>(
+    socket: &mut T,
+    server: Arc<UsbIpServer>,
+    responses: tokio::sync::mpsc::UnboundedSender<UsbIpResponse>,
+) -> Result<()> {
     let mut current_import_device_id: Option<String> = None;
+    let mut ctx: Option<LaneContext> = None;
+    let mut lanes: HashMap<u8, std::sync::mpsc::Sender<Urb>> = HashMap::new();
+    let pending: Arc<Mutex<HashSet<u32>>> = Default::default();
+    let closed = Arc::new(AtomicBool::new(false));
     loop {
-        let command = UsbIpCommand::read_from_socket(&mut socket).await;
+        let command = UsbIpCommand::read_from_socket(socket).await;
         if let Err(err) = command {
+            closed.store(true, Ordering::Relaxed);
             if let Some(dev_id) = current_import_device_id {
                 let mut used_devices = server.used_devices.write().await;
                 let mut available_devices = server.available_devices.write().await;
@@ -483,28 +625,21 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
             }
         }
 
-        let used_devices = server.used_devices.read().await;
-        let mut current_import_device = current_import_device_id
-            .clone()
-            .and_then(|ref id| used_devices.get(id));
-
         match command.unwrap() {
             UsbIpCommand::OpReqDevlist { .. } => {
                 trace!("Got OP_REQ_DEVLIST");
                 let devices = server.available_devices.read().await;
 
                 // OP_REP_DEVLIST
-                UsbIpResponse::op_rep_devlist(&devices)
-                    .write_to_socket(socket)
-                    .await?;
+                let _ = responses.send(UsbIpResponse::op_rep_devlist(&devices));
                 trace!("Sent OP_REP_DEVLIST");
             }
             UsbIpCommand::OpReqImport { busid, .. } => {
                 trace!("Got OP_REQ_IMPORT");
 
                 current_import_device_id = None;
-                current_import_device = None;
-                std::mem::drop(used_devices);
+                ctx = None;
+                lanes.clear();
 
                 let mut used_devices = server.used_devices.write().await;
                 let mut available_devices = server.available_devices.write().await;
@@ -515,18 +650,27 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                         let dev = available_devices.remove(i);
                         let dev_id = dev.bus_id.clone();
                         used_devices.insert(dev.bus_id.clone(), dev);
-                        current_import_device_id = dev_id.clone().into();
-                        current_import_device = Some(used_devices.get(&dev_id).unwrap());
+                        current_import_device_id = dev_id.into();
                         break;
                     }
                 }
 
+                let current_import_device = current_import_device_id
+                    .as_ref()
+                    .and_then(|id| used_devices.get(id));
                 let res = if let Some(dev) = current_import_device {
+                    ctx = Some(LaneContext {
+                        device: Arc::new(dev.clone()),
+                        responses: responses.clone(),
+                        pending: pending.clone(),
+                        closed: closed.clone(),
+                        runtime: tokio::runtime::Handle::current(),
+                    });
                     UsbIpResponse::op_rep_import_success(dev)
                 } else {
                     UsbIpResponse::op_rep_import_fail()
                 };
-                res.write_to_socket(socket).await?;
+                let _ = responses.send(res);
                 trace!("Sent OP_REP_IMPORT");
             }
             UsbIpCommand::UsbIpCmdSubmit {
@@ -537,66 +681,27 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
                 ..
             } => {
                 trace!("Got USBIP_CMD_SUBMIT");
-                let device = current_import_device.unwrap();
+                let ctx = ctx.as_ref().unwrap();
 
                 let out = header.direction == 0;
-                let real_ep = if out { header.ep } else { header.ep | 0x80 };
+                let real_ep = (if out { header.ep } else { header.ep | 0x80 }) as u8;
 
                 header.command = USBIP_RET_SUBMIT.into();
+                pending.lock().unwrap().insert(header.seqnum);
 
-                let res = match device.find_ep(real_ep as u8) {
-                    None => {
-                        warn!("Endpoint {real_ep:02x?} not found");
-                        UsbIpResponse::usbip_ret_submit_fail(&header)
-                    }
-                    Some((ep, intf)) => {
-                        trace!("->Endpoint {ep:02x?}");
-                        trace!("->Setup {setup:02x?}");
-                        trace!("->Request {data:02x?}");
-                        let resp = device
-                            .handle_urb(
-                                ep,
-                                intf,
-                                transfer_buffer_length,
-                                SetupPacket::parse(&setup),
-                                &data,
-                            )
-                            .await;
-
-                        match resp {
-                            Ok(resp) => {
-                                if out {
-                                    trace!("<-Wrote {}", data.len());
-                                } else {
-                                    trace!("<-Resp {resp:02x?}");
-                                }
-                                let actual_length = if out {
-                                    debug_assert!(
-                                        resp.is_empty(),
-                                        "OUT transfer should return empty response buffer"
-                                    );
-                                    data.len() as u32
-                                } else {
-                                    resp.len() as u32
-                                };
-                                UsbIpResponse::usbip_ret_submit_success(
-                                    &header,
-                                    0,
-                                    0,
-                                    actual_length,
-                                    resp,
-                                    vec![],
-                                )
-                            }
-                            Err(err) => {
-                                warn!("Error handling URB: {err}");
-                                UsbIpResponse::usbip_ret_submit_fail(&header)
-                            }
-                        }
-                    }
+                // both directions of ep0 are one pipe and share a lane
+                let lane = if real_ep & 0x7f == 0 { 0 } else { real_ep };
+                let urb = Urb {
+                    header,
+                    real_ep,
+                    transfer_buffer_length,
+                    setup,
+                    data,
                 };
-                res.write_to_socket(socket).await?;
-                trace!("Sent USBIP_RET_SUBMIT");
+                let _ = lanes
+                    .entry(lane)
+                    .or_insert_with(|| ctx.spawn_lane())
+                    .send(urb);
             }
             UsbIpCommand::UsbIpCmdUnlink {
                 mut header,
@@ -606,8 +711,16 @@ pub async fn handler<T: AsyncReadExt + AsyncWriteExt + Unpin>(
 
                 header.command = USBIP_RET_UNLINK.into();
 
-                let res = UsbIpResponse::usbip_ret_unlink_success(&header);
-                res.write_to_socket(socket).await?;
+                let res = if pending.lock().unwrap().remove(&unlink_seqnum) {
+                    UsbIpResponse::UsbIpRetUnlink {
+                        header,
+                        status: (-ECONNRESET) as u32,
+                    }
+                } else {
+                    // already answered
+                    UsbIpResponse::usbip_ret_unlink_success(&header)
+                };
+                let _ = responses.send(res);
                 trace!("Sent USBIP_RET_UNLINK");
             }
         }
@@ -902,5 +1015,198 @@ mod tests {
         handler(&mut mock_socket, Arc::new(server)).await.ok();
         // OP_REQ_IMPORT + USBIP_CMD_SUBMIT + Device Descriptor
         assert_eq!(mock_socket.output.len(), 0x140 + 0x30 + 0x12);
+    }
+
+    /// Answers every URB on its interface after `delay` with `reply`, or with
+    /// [ErrorKind::TimedOut] while `timeouts` is above zero.
+    #[derive(Debug)]
+    struct ScriptedHandler {
+        delay: std::time::Duration,
+        timeouts: usize,
+        reply: Vec<u8>,
+    }
+
+    impl UsbInterfaceHandler for ScriptedHandler {
+        fn get_class_specific_descriptor(&self) -> Vec<u8> {
+            vec![]
+        }
+
+        fn handle_urb(
+            &mut self,
+            _interface: &UsbInterface,
+            _ep: UsbEndpoint,
+            _transfer_buffer_length: u32,
+            _setup: SetupPacket,
+            _req: &[u8],
+        ) -> Result<Vec<u8>> {
+            std::thread::sleep(self.delay);
+            if self.timeouts > 0 {
+                self.timeouts -= 1;
+                return Err(ErrorKind::TimedOut.into());
+            }
+            Ok(self.reply.clone())
+        }
+
+        fn as_any(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
+
+    fn scripted_device(handlers: Vec<(u8, ScriptedHandler)>) -> UsbDevice {
+        handlers
+            .into_iter()
+            .fold(UsbDevice::new(0), |device, (address, handler)| {
+                device.with_interface(
+                    ClassCode::HID as u8,
+                    0,
+                    0,
+                    None,
+                    vec![UsbEndpoint {
+                        address,
+                        attributes: EndpointAttributes::Interrupt as u8,
+                        max_packet_size: 8,
+                        interval: 10,
+                    }],
+                    Arc::new(Mutex::new(
+                        Box::new(handler) as Box<dyn UsbInterfaceHandler + Send>
+                    )),
+                )
+            })
+    }
+
+    fn submit_in(seqnum: u32, ep: u32) -> UsbIpCommand {
+        UsbIpCommand::UsbIpCmdSubmit {
+            header: UsbIpHeaderBasic {
+                command: USBIP_CMD_SUBMIT.into(),
+                seqnum,
+                devid: 0,
+                direction: 1, // IN
+                ep,
+            },
+            transfer_flags: 0,
+            transfer_buffer_length: 8,
+            start_frame: 0,
+            number_of_packets: 0,
+            interval: 0,
+            setup: [0; 8],
+            data: vec![],
+            iso_packet_descriptor: vec![],
+        }
+    }
+
+    fn u32_at(buf: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[tokio::test]
+    async fn slow_endpoint_does_not_block_other_endpoints() {
+        setup_test_logger();
+        let device = scripted_device(vec![
+            (
+                0x81,
+                ScriptedHandler {
+                    delay: std::time::Duration::from_millis(300),
+                    timeouts: 0,
+                    reply: vec![0xa],
+                },
+            ),
+            (
+                0x82,
+                ScriptedHandler {
+                    delay: std::time::Duration::ZERO,
+                    timeouts: 0,
+                    reply: vec![0xb],
+                },
+            ),
+        ]);
+        let server = UsbIpServer::new_simulated(vec![device]);
+
+        let mut req = op_req_import(SINGLE_DEVICE_BUSID);
+        req.extend(submit_in(1, 1).to_bytes());
+        req.extend(submit_in(2, 2).to_bytes());
+
+        let mut mock_socket = MockSocket::new(req);
+        handler(&mut mock_socket, Arc::new(server)).await.ok();
+
+        // after OP_REP_IMPORT, the fast endpoint's RET_SUBMIT precedes the slow one's
+        let out = &mock_socket.output[0x140..];
+        assert_eq!(out.len(), 2 * (0x30 + 1));
+        assert_eq!(u32_at(out, 4), 2);
+        assert_eq!(u32_at(out, 0x30 + 1 + 4), 1);
+    }
+
+    #[tokio::test]
+    async fn unlink_cancels_a_pending_in_transfer() {
+        setup_test_logger();
+        let device = scripted_device(vec![(
+            0x81,
+            ScriptedHandler {
+                delay: std::time::Duration::from_millis(10),
+                timeouts: usize::MAX,
+                reply: vec![],
+            },
+        )]);
+        let server = UsbIpServer::new_simulated(vec![device]);
+
+        let mut req = op_req_import(SINGLE_DEVICE_BUSID);
+        req.extend(submit_in(1, 1).to_bytes());
+        req.extend(
+            UsbIpCommand::UsbIpCmdUnlink {
+                header: UsbIpHeaderBasic {
+                    command: usbip_protocol::USBIP_CMD_UNLINK.into(),
+                    seqnum: 2,
+                    devid: 0,
+                    direction: 0,
+                    ep: 0,
+                },
+                unlink_seqnum: 1,
+            }
+            .to_bytes(),
+        );
+
+        let mut mock_socket = MockSocket::new(req);
+        handler(&mut mock_socket, Arc::new(server)).await.ok();
+
+        // only RET_UNLINK, reporting the URB as unlinked; no RET_SUBMIT for it
+        let out = &mock_socket.output[0x140..];
+        assert_eq!(out.len(), 0x30);
+        assert_eq!(u32_at(out, 0), USBIP_RET_UNLINK as u32);
+        assert_eq!(u32_at(out, 20), (-104i32) as u32); // -ECONNRESET
+    }
+
+    #[tokio::test]
+    async fn in_transfer_stays_pending_until_data_arrives() {
+        setup_test_logger();
+        let device = scripted_device(vec![(
+            0x81,
+            ScriptedHandler {
+                delay: std::time::Duration::from_millis(10),
+                timeouts: 3,
+                reply: vec![0xc],
+            },
+        )]);
+        let server_ = Arc::new(UsbIpServer::new_simulated(vec![device]));
+        let addr = get_free_address().await;
+        tokio::spawn(server(addr, server_));
+
+        let mut connection = poll_connect(addr).await;
+        assert_eq!(attach_device(&mut connection, SINGLE_DEVICE_BUSID).await, 0);
+        connection
+            .write_all(submit_in(1, 1).to_bytes().as_slice())
+            .await
+            .unwrap();
+
+        let mut out = vec![0; 0x30 + 1];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connection.read_exact(&mut out),
+        )
+        .await
+        .expect("no RET_SUBMIT with data within 5 s")
+        .unwrap();
+        assert_eq!(u32_at(&out, 4), 1);
+        assert_eq!(u32_at(&out, 20), 0); // status
+        assert_eq!(u32_at(&out, 24), 1); // actual_length
+        assert_eq!(out[0x30], 0xc);
     }
 }

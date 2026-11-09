@@ -21,13 +21,83 @@ fn in_transfer_len(requested: u32, max_packet_size: usize) -> usize {
 /// A handler to pass requests to interface of a rusb USB device of the host
 #[derive(Clone, Debug)]
 pub struct RusbUsbHostInterfaceHandler {
-    handle: Arc<Mutex<DeviceHandle<GlobalContext>>>,
+    handle: Arc<DeviceHandle<GlobalContext>>,
 }
 
 impl RusbUsbHostInterfaceHandler {
-    pub fn new(handle: Arc<Mutex<DeviceHandle<GlobalContext>>>) -> Self {
+    pub fn new(handle: Arc<DeviceHandle<GlobalContext>>) -> Self {
         Self { handle }
     }
+
+    /// The device handle, for transfers that run without the interface lock.
+    pub(crate) fn handle(&self) -> Arc<DeviceHandle<GlobalContext>> {
+        self.handle.clone()
+    }
+}
+
+/// How long one interrupt IN attempt waits for data. A URB unlinked meanwhile
+/// keeps its endpoint busy for at most this long, and a report that arrives in
+/// that window is dropped with it.
+const INTERRUPT_IN_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Map a failed interrupt or bulk transfer to an I/O error.
+///
+/// An IN transfer that saw no data reports [ErrorKind::TimedOut], which the
+/// server answers by retrying while the URB is pending. Known limitation: libusb
+/// drops the data of a transfer that times out partway through a multi-packet
+/// bulk IN; a longer bulk timeout makes that rarer.
+fn transfer_error(err: rusb::Error, direction: Direction) -> std::io::Error {
+    match (err, direction) {
+        (rusb::Error::Timeout, Direction::In) => ErrorKind::TimedOut.into(),
+        (err, _) => std::io::Error::other(err),
+    }
+}
+
+/// Run an interrupt or bulk transfer on `handle`.
+///
+/// Takes no lock: [DeviceHandle] is `Sync`, and libusb runs transfers on
+/// different endpoints concurrently. The server calls this directly for host
+/// passthrough interfaces, so that an IN transfer waiting for data does not
+/// hold up the other endpoints of its interface.
+pub(crate) fn endpoint_transfer(
+    handle: &DeviceHandle<GlobalContext>,
+    ep: UsbEndpoint,
+    transfer_buffer_length: u32,
+    req: &[u8],
+) -> Result<Vec<u8>> {
+    let mut buffer = vec![0u8; transfer_buffer_length as usize];
+    let timeout = std::time::Duration::new(1, 0);
+    if ep.attributes == EndpointAttributes::Interrupt as u8 {
+        // interrupt
+        if let Direction::In = ep.direction() {
+            // interrupt in
+            let len = handle
+                .read_interrupt(ep.address, &mut buffer, INTERRUPT_IN_POLL)
+                .map_err(|err| transfer_error(err, Direction::In))?;
+            debug!("intr in {:?}", &buffer[..len]);
+            return Ok(Vec::from(&buffer[..len]));
+        } else {
+            // interrupt out
+            handle
+                .write_interrupt(ep.address, req, timeout)
+                .map_err(|err| transfer_error(err, Direction::Out))?;
+        }
+    } else if ep.attributes == EndpointAttributes::Bulk as u8 {
+        // bulk
+        if let Direction::In = ep.direction() {
+            // bulk in
+            let len = handle
+                .read_bulk(ep.address, &mut buffer, timeout)
+                .map_err(|err| transfer_error(err, Direction::In))?;
+            return Ok(Vec::from(&buffer[..len]));
+        } else {
+            // bulk out
+            handle
+                .write_bulk(ep.address, req, timeout)
+                .map_err(|err| transfer_error(err, Direction::Out))?;
+        }
+    }
+    Ok(vec![])
 }
 
 impl UsbInterfaceHandler for RusbUsbHostInterfaceHandler {
@@ -42,7 +112,7 @@ impl UsbInterfaceHandler for RusbUsbHostInterfaceHandler {
         debug!("To host device: ep={ep:?} setup={setup:?} req={req:?}",);
         let mut buffer = vec![0u8; transfer_buffer_length as usize];
         let timeout = std::time::Duration::new(1, 0);
-        let handle = self.handle.lock().unwrap();
+        let handle = &self.handle;
         if ep.attributes == EndpointAttributes::Control as u8 {
             // control
             if let Direction::In = ep.direction() {
@@ -70,29 +140,8 @@ impl UsbInterfaceHandler for RusbUsbHostInterfaceHandler {
                     )
                     .ok();
             }
-        } else if ep.attributes == EndpointAttributes::Interrupt as u8 {
-            // interrupt
-            if let Direction::In = ep.direction() {
-                // interrupt in
-                if let Ok(len) = handle.read_interrupt(ep.address, &mut buffer, timeout) {
-                    info!("intr in {:?}", &buffer[..len]);
-                    return Ok(Vec::from(&buffer[..len]));
-                }
-            } else {
-                // interrupt out
-                handle.write_interrupt(ep.address, req, timeout).ok();
-            }
-        } else if ep.attributes == EndpointAttributes::Bulk as u8 {
-            // bulk
-            if let Direction::In = ep.direction() {
-                // bulk in
-                if let Ok(len) = handle.read_bulk(ep.address, &mut buffer, timeout) {
-                    return Ok(Vec::from(&buffer[..len]));
-                }
-            } else {
-                // bulk out
-                handle.write_bulk(ep.address, req, timeout).ok();
-            }
+        } else {
+            return endpoint_transfer(handle, ep, transfer_buffer_length, req);
         }
         Ok(vec![])
     }
@@ -109,11 +158,11 @@ impl UsbInterfaceHandler for RusbUsbHostInterfaceHandler {
 /// A handler to pass requests to device of a rusb USB device of the host
 #[derive(Clone, Debug)]
 pub struct RusbUsbHostDeviceHandler {
-    handle: Arc<Mutex<DeviceHandle<GlobalContext>>>,
+    handle: Arc<DeviceHandle<GlobalContext>>,
 }
 
 impl RusbUsbHostDeviceHandler {
-    pub fn new(handle: Arc<Mutex<DeviceHandle<GlobalContext>>>) -> Self {
+    pub fn new(handle: Arc<DeviceHandle<GlobalContext>>) -> Self {
         Self { handle }
     }
 }
@@ -128,7 +177,7 @@ impl UsbDeviceHandler for RusbUsbHostDeviceHandler {
         debug!("To host device: setup={setup:?} req={req:?}");
         let mut buffer = vec![0u8; transfer_buffer_length as usize];
         let timeout = std::time::Duration::new(1, 0);
-        let handle = self.handle.lock().unwrap();
+        let handle = &self.handle;
         // control
         if setup.request_type & 0x80 == 0 {
             // control out
