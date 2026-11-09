@@ -61,7 +61,7 @@ async fn main() {
         })),
     };
 
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 3240);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3240);
     tokio::spawn(usbip::server(addr, server));
 
     loop {
